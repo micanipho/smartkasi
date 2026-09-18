@@ -1,0 +1,1177 @@
+#!/usr/bin/env node
+/**
+ * SmartKasi API smoke test.
+ *
+ *   node scripts/smoke.mjs
+ *   node scripts/smoke.mjs --base https://smartkasi-api.up.railway.app/v1
+ *
+ * Runs the endpoints that matter against a running API with db/seed.sql loaded.
+ * Exits non-zero if anything fails, so it works in CI as-is.
+ *
+ * Auth: if SUPABASE_JWT_SECRET is set (in the environment or apps/api/.env) the
+ * script signs its own HS256 tokens. If your project uses asymmetric keys
+ * instead, grab real tokens from the client and pass them:
+ *
+ *   OWNER_TOKEN=... OWNER2_TOKEN=... CUSTOMER_TOKEN=... node scripts/smoke.mjs
+ */
+
+import { createHmac, randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+
+// ---- config ---------------------------------------------------------------
+
+const ENV_PATHS = [
+  join(HERE, '..', '.env.local'),              // Supabase's dashboard snippets use this
+  join(HERE, '..', '.env'),                    // the convention in this repo
+  join(HERE, '..', '..', '..', '.env.local'),  // repo root variants
+  join(HERE, '..', '..', '..', '.env'),
+];
+const ENV_FOUND = ENV_PATHS.filter(loadDotEnv);
+
+const argBase = argValue('--base');
+const PUBLIC_ONLY = process.argv.includes('--public-only');
+const BASE = (argBase ?? process.env.SMOKE_BASE_URL ?? 'http://localhost:3000/v1').replace(/\/$/, '');
+const SECRET = process.env.SUPABASE_JWT_SECRET;
+
+// Seeded ids from db/seed.sql.
+const IDS = {
+  owner1: '11111111-0000-4000-8000-000000000001',   // Mama Thoko's
+  owner2: '11111111-0000-4000-8000-000000000002',   // Bra Sipho
+  owner3: '11111111-0000-4000-8000-000000000003',   // Naledi, Kasi Fresh — the unlicensed fixture
+  customer: '22222222-0000-4000-8000-000000000002', // Lerato
+  courier: '33333333-0000-4000-8000-000000000003',  // Thabo, bicycle, verified
+  admin: '44444444-0000-4000-8000-000000000004',    // Ayanda, platform operator
+  shop1: '7b0e1c2a-1111-4a3b-9c11-aaaaaaaaaaaa',
+  shop2: '7b0e1c2a-2222-4a3b-9c11-bbbbbbbbbbbb',
+  shop3: '7b0e1c2a-3333-4a3b-9c11-cccccccccccc',    // advertising_only
+  maize: '3f0a9d10-aaaa-4c11-9999-111111111111',
+  soap: '3f0a9d10-bbbb-4c11-9999-222222222222',
+  chakalaka: '3f0a9d10-dddd-4c11-9999-444444444444',
+  maizeBarcode: '6001068000456',
+};
+
+const TOKENS = {
+  owner1: process.env.OWNER_TOKEN ?? mint(IDS.owner1, 'shop_owner'),
+  owner2: process.env.OWNER2_TOKEN ?? mint(IDS.owner2, 'shop_owner'),
+  owner3: process.env.OWNER3_TOKEN ?? mint(IDS.owner3, 'shop_owner'),
+  customer: process.env.CUSTOMER_TOKEN ?? mint(IDS.customer, 'customer'),
+  courier: process.env.COURIER_TOKEN ?? mint(IDS.courier, 'courier'),
+  admin: process.env.ADMIN_TOKEN ?? mint(IDS.admin, 'admin'),
+};
+
+// True when the tokens came from GoTrue rather than from mint(). Only real
+// tokens exercise the custom access token hook, so the claim checks announce
+// which mode they ran in instead of quietly proving nothing.
+// Declared here, not beside claimRole(): the role checks run long before the
+// helper section, and reading a const in its TDZ throws.
+const REAL_TOKENS = Boolean(process.env.COURIER_TOKEN);
+
+// ---- tiny test harness ----------------------------------------------------
+
+let passed = 0;
+const failures = [];
+// Declared up here rather than beside pgOne: the role checks run before the
+// helper definitions are reached, and reading a `let` in its TDZ throws.
+let pgClient;
+const c = process.stdout.isTTY
+  ? { g: '\x1b[32m', r: '\x1b[31m', d: '\x1b[2m', y: '\x1b[33m', x: '\x1b[0m' }
+  : { g: '', r: '', d: '', y: '', x: '' };
+
+async function check(name, fn) {
+  try {
+    const detail = await fn();
+    passed++;
+    console.log(`  ${c.g}PASS${c.x}  ${name}${detail ? `  ${c.d}${detail}${c.x}` : ''}`);
+  } catch (err) {
+    failures.push({ name, message: err.message });
+    console.log(`  ${c.r}FAIL${c.x}  ${name}\n        ${c.r}${err.message}${c.x}`);
+  }
+}
+
+let skipped = 0;
+
+/** Used for the authenticated checks when --public-only is passed. */
+async function checkAuth(name, fn) {
+  if (PUBLIC_ONLY) {
+    skipped++;
+    console.log(`  ${c.y}SKIP${c.x}  ${name}  ${c.d}(needs a token)${c.x}`);
+    return;
+  }
+  return check(name, fn);
+}
+
+function expect(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+async function api(path, { method = 'GET', token, body } = {}) {
+  let res;
+  try {
+    res = await fetch(`${BASE}${path}`, {
+      method,
+      headers: {
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(body ? { 'Content-Type': 'application/json' } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch (err) {
+    // A dead connection mid-run is more useful as a readable failure than as
+    // an undici stack trace.
+    return { status: 0, body: null, raw: '', networkError: err.cause?.code ?? err.message };
+  }
+  const text = await res.text();
+  let json;
+  try { json = text ? JSON.parse(text) : null; } catch { json = null; }
+  return { status: res.status, body: json, raw: text };
+}
+
+const rands = (cents) => `R${(cents / 100).toFixed(2)}`;
+
+// ---- run ------------------------------------------------------------------
+
+const authSource = SECRET
+  ? 'self-signed HS256'
+  : process.env.OWNER_TOKEN
+    ? 'tokens from env'
+    : `${c.y}none${c.x}`;
+
+console.log(`\nSmartKasi smoke test  ${c.d}${BASE}${c.x}`);
+console.log(`Env file: ${ENV_FOUND.length ? c.d + ENV_FOUND.join(', ') + c.x : c.y + 'none found' + c.x}`);
+console.log(`Auth:     ${authSource}\n`);
+
+// --- health first -----------------------------------------------------------
+// Whether the database is connected is more fundamental than whether you have a
+// token, so this runs before the auth gate. You should never be blocked on a
+// token while the real problem is that Postgres is unreachable.
+
+console.log('System');
+const health = await api('/health');
+if (health.status !== 200) {
+  console.error(`${c.r}Cannot reach the API at ${BASE}.${c.x}`);
+  if (health.networkError) {
+    console.error(`  ${health.networkError} — nothing is listening there.`);
+    console.error('  Start it with:  npm run start:dev   (from apps/api)');
+  } else {
+    console.error(`  HTTP ${health.status}.`);
+    console.error('  Check the base URL — the API is served under /v1, so it should end in /v1.');
+  }
+  console.error('');
+  process.exit(1);
+}
+await check('health returns ok', () => {
+  expect(health.body.status === 'ok', `status is "${health.body.status}" — "degraded" means the API is up but the database is NOT. Fix DATABASE_URL before anything else.`);
+  return `v${health.body.version}`;
+});
+
+// --- auth gate --------------------------------------------------------------
+
+if (!TOKENS.owner1 && !PUBLIC_ONLY) {
+  console.log(`\n${c.y}No way to authenticate — stopping before the authenticated checks.${c.x}`);
+  console.log('');
+  console.log('  To run just the public checks right now:');
+  console.log(`    ${c.d}npm run smoke -- --public-only${c.x}`);
+  console.log('');
+  console.log('  For the full suite, this script needs to present a token the API accepts.');
+  console.log('  It has to match however the API itself is configured:');
+  console.log('');
+  console.log(`    ${c.d}Legacy Supabase (HS256 shared secret)${c.x}`);
+  console.log('      Put the same SUPABASE_JWT_SECRET in apps/api/.env that the API uses,');
+  console.log('      and this script will sign its own tokens.');
+  console.log('');
+  console.log(`    ${c.d}Newer Supabase (asymmetric keys)${c.x}`);
+  console.log('      SUPABASE_JWT_SECRET is blank by design. Sign in as each seeded user');
+  console.log('      from a client, then pass the real access tokens:');
+  console.log('        OWNER_TOKEN=... OWNER2_TOKEN=... CUSTOMER_TOKEN=... npm run smoke');
+  console.log('');
+  console.log('  Seeded users:');
+  console.log(`    owner, Mama Thoko's   ${IDS.owner1}`);
+  console.log(`    owner, Bra Sipho      ${IDS.owner2}`);
+  console.log(`    customer (Lerato)     ${IDS.customer}`);
+  console.log('');
+  process.exit(1);
+}
+
+const seedCheck = await api(`/shops?lat=-26.238&lng=27.9083&radius_m=3000`);
+if (!seedCheck.body?.data?.length) {
+  console.error(`\n${c.r}No shops found. Did you run db/seed.sql?${c.x}`);
+  console.error('  npm run db:seed   (from apps/api)\n');
+  process.exit(1);
+}
+
+console.log('\nShops & geo');
+await check('nearby shops have real distances', () => {
+  const shops = seedCheck.body.data;
+  expect(shops.length === 2, `expected 2 shops within 3km, got ${shops.length}`);
+  const thoko = shops.find((s) => s.name.startsWith('Mama Thoko'));
+  expect(thoko, "Mama Thoko's Tuckshop missing");
+  expect(typeof thoko.distance_m === 'number', 'distance_m is not a number');
+  return shops.map((s) => `${s.name.split(' ')[0]} ${s.distance_m}m`).join(', ');
+});
+
+await check('radius actually filters (500m)', async () => {
+  const r = await api('/shops?lat=-26.238&lng=27.9083&radius_m=500');
+  expect(r.body.meta.total === 1, `expected 1 shop within 500m, got ${r.body.meta.total}`);
+  return '1 shop';
+});
+
+await check('advertising-only shop cannot take orders', async () => {
+  const r = await api(`/shops/${IDS.shop3}`);
+  expect(r.body.accepts_orders === false, 'Kasi Fresh should not accept orders');
+  expect(r.body.licence_status === 'none', `licence_status is ${r.body.licence_status}`);
+  return 'licence gate holding';
+});
+
+console.log('\nCatalog & price comparison');
+await check('price comparison across shops', async () => {
+  const r = await api('/search/products?q=maize&lat=-26.238&lng=27.9083&radius_m=5000');
+  const hit = r.body.data[0];
+  expect(hit, 'no results for "maize"');
+  expect(hit.price_stats.offer_count === 3, `expected 3 offers, got ${hit.price_stats.offer_count}`);
+  expect(hit.offers[0].price_cents <= hit.offers[1].price_cents, 'offers are not sorted cheapest first');
+  return `${hit.price_stats.offer_count} offers, ${rands(hit.price_stats.min_price_cents)}–${rands(hit.price_stats.max_price_cents)}, avg ${rands(hit.price_stats.avg_price_cents)}`;
+});
+
+await check('shop-local items excluded from comparison', async () => {
+  const r = await api('/search/products?q=kota');
+  expect(r.body.meta.total === 0, `kota has no barcode so it must not be comparable, got ${r.body.meta.total}`);
+  return '0 results, correct';
+});
+
+await check('barcode scan returns price + stock in one call', async () => {
+  const r = await api(`/products/barcode/${IDS.maizeBarcode}?shop_id=${IDS.shop1}`);
+  expect(r.status === 200, `status ${r.status}`);
+  expect(r.body.shop_product, 'shop_product missing — pass shop_id');
+  return `${r.body.product.name} @ ${rands(r.body.shop_product.price_cents)}, ${r.body.shop_product.stock_qty} in stock`;
+});
+
+await check('unknown barcode returns 404 PRODUCT_NOT_FOUND', async () => {
+  const r = await api('/products/barcode/0000000000000');
+  expect(r.status === 404, `status ${r.status}`);
+  expect(r.body.error.code === 'PRODUCT_NOT_FOUND', `code ${r.body.error?.code}`);
+  return 'normal outcome, not an error condition';
+});
+
+console.log('\nAuth');
+await check('no token returns 401', async () => {
+  const r = await api('/me');
+  expect(r.status === 401, `status ${r.status}`);
+  return r.body.error.code;
+});
+
+await checkAuth('owner token resolves the profile', async () => {
+  const r = await api('/me', { token: TOKENS.owner1 });
+  expect(r.status === 200, `status ${r.status} ${r.body?.error?.code ?? ''} — if this is UNAUTHENTICATED, your HS256 vs JWKS setting is wrong`);
+  expect(r.body.role === 'shop_owner', `role is ${r.body.role}`);
+  expect(r.body.shop_ids.includes(IDS.shop1), 'owner is not linked to Mama Thoko\'s');
+  return `${r.body.full_name}, ${r.body.shop_ids.length} shop`;
+});
+
+
+// --- the role claim --------------------------------------------------------
+// These only mean something under `npm run smoke:auth`. mint() hard-codes the
+// role into self-signed HS256 tokens, so plain `npm run smoke` would pass the
+// first two with the hook switched off entirely.
+await checkAuth('courier token carries the courier claim', async () => {
+  const role = claimRole(TOKENS.courier);
+  expect(role === 'courier', `app_metadata.role is ${role ?? 'absent'} — is the custom access token hook registered?`);
+  return REAL_TOKENS ? 'from the hook' : 'self-signed, proves nothing';
+});
+
+await checkAuth('the claim is what authorises, not the profile row', async () => {
+  const denied = await api('/courier/jobs', { token: TOKENS.customer });
+  expect(denied.status === 403, `customer got ${denied.status} on the job board`);
+  const allowed = await api('/courier/jobs', { token: TOKENS.courier });
+  expect(allowed.status === 200, `courier got ${allowed.status} on the job board`);
+  return '403 for the customer, 200 for the courier';
+});
+
+// The actual regression test for issue #21: change the row, and the NEXT token
+// must carry the new role. Reverts itself, but it does write — like the POS
+// batch and the order below it, this suite is for demo data only.
+await checkAuth('a role change reaches the next token', async () => {
+  if (!REAL_TOKENS) return 'skipped — needs smoke:auth, self-signed tokens cannot show this';
+
+  const elevate = await api(`/admin/users/${IDS.customer}/role`, {
+    method: 'PATCH', token: TOKENS.admin, body: { role: 'courier' },
+  });
+  expect(elevate.status === 200, `elevate returned ${elevate.status} ${elevate.body?.error?.code ?? ''}`);
+
+  try {
+    const fresh = await signIn('customer@smartkasi.test');
+    expect(claimRole(fresh) === 'courier', `new token still says ${claimRole(fresh)} — the hook is not reading profiles.role`);
+
+    // The role gate must now let them through. It is NOT a 200: the job board
+    // also needs a `couriers` row, and Lerato has none — being given the role
+    // does not register you as a courier. Asserting 200 here would be asserting
+    // that the two are the same thing, which is exactly what they are not.
+    const jobs = await api('/courier/jobs', { token: fresh });
+    expect(
+      jobs.status !== 401,
+      `elevated user got 401 — the new claim is not being accepted at all`,
+    );
+    expect(
+      /not registered as a courier/i.test(jobs.body?.error?.message ?? ''),
+      `expected to clear the role gate and stop at the courier-record check, got ${jobs.status} ${jobs.body?.error?.message ?? ''}`,
+    );
+  } finally {
+    await api(`/admin/users/${IDS.customer}/role`, {
+      method: 'PATCH', token: TOKENS.admin, body: { role: 'customer' },
+    });
+  }
+
+  const reverted = await signIn('customer@smartkasi.test');
+  expect(claimRole(reverted) === 'customer', `revert failed, still ${claimRole(reverted)}`);
+  return 'customer -> courier -> customer, claim followed each time';
+});
+// --- role claims ------------------------------------------------------------
+// Regression cover for the 2026-08-24 fix. profiles.role was documented as
+// being mirrored into the JWT and nothing ever did it, so every user who signed
+// up through the app was a customer permanently and the courier and shop-owner
+// apps had no front door. It stayed invisible because every other check here
+// runs as a pre-provisioned demo user whose claim was set by hand at seed time.
+//
+// Three things have to hold and each can break on its own:
+//   1. t_profiles_role_to_auth keeps auth.users.raw_app_meta_data in step
+//   2. custom_access_token_hook puts the role on the FIRST token, not the second
+//   3. a change to profiles.role reaches the next issued token
+//
+// If these start failing, check the hook is still switched on before you touch
+// the SQL: supabase/config.toml locally, Dashboard -> Authentication -> Hooks
+// on the hosted project. Disabling it degrades 2 without touching 1 or 3.
+
+console.log('\nRole claims');
+
+const SB_URL = process.env.SUPABASE_URL?.replace(/\/$/, '');
+const SB_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const PG_URL = process.env.DIRECT_URL ?? process.env.DATABASE_URL;
+const probe = { id: randomUUID(), email: `smoke-role-${Date.now()}@smartkasi.test`, password: 'Password123!' };
+
+await checkRole('a fresh courier gets the role on their FIRST token', async () => {
+  const created = await gotrue('/auth/v1/admin/users', {
+    method: 'POST',
+    body: {
+      id: probe.id,
+      email: probe.email,
+      password: probe.password,
+      email_confirm: true,
+      user_metadata: { full_name: 'Smoke Courier' },
+      app_metadata: { role: 'courier' },
+    },
+  });
+  expect(created.status === 200 || created.status === 201, `admin create returned ${created.status} ${created.raw.slice(0, 160)}`);
+
+  const token = await signIn(probe.email, probe.password);
+  const role = claimRole(token);
+  // Not "after a refresh" — this is the very first access token GoTrue issues.
+  expect(role === 'courier', `first token says role=${role ?? '(absent)'}. If it says customer, the custom access token hook is not enabled or not reachable by supabase_auth_admin.`);
+
+  const me = await api('/me', { token });
+  expect(me.status === 200, `/me returned ${me.status}`);
+  expect(me.body.role === 'courier', `/me says ${me.body.role}`);
+  return 'courier on token #1';
+});
+
+await checkRole('the signup trigger mirrors role into auth.users', async () => {
+  const claim = await pgOne(
+    `select raw_app_meta_data->>'role' as role from auth.users where id = $1`,
+    [probe.id],
+  );
+  expect(claim?.role === 'courier', `raw_app_meta_data.role is ${claim?.role ?? '(absent)'} — t_profiles_role_to_auth is missing or was dropped`);
+
+  const profile = await pgOne(`select role from public.profiles where id = $1`, [probe.id]);
+  expect(profile?.role === 'courier', `profiles.role is ${profile?.role ?? '(no row)'} — handle_new_auth_user is not reading raw_app_meta_data`);
+  return 'profiles.role and the claim agree';
+}, { needsDb: true });
+
+await checkRole('changing profiles.role reaches the next issued token', async () => {
+  await pgOne(`update public.profiles set role = 'shop_owner' where id = $1 returning role`, [probe.id]);
+
+  const claim = await pgOne(
+    `select raw_app_meta_data->>'role' as role from auth.users where id = $1`,
+    [probe.id],
+  );
+  expect(claim?.role === 'shop_owner', `the trigger did not mirror the update — raw_app_meta_data.role is still ${claim?.role}`);
+
+  const token = await signIn(probe.email, probe.password);
+  const role = claimRole(token);
+  expect(role === 'shop_owner', `the new token still says ${role} — a role change is not reaching the JWT`);
+
+  const me = await api('/me', { token });
+  expect(me.body?.role === 'shop_owner', `/me says ${me.body?.role}`);
+  return 'courier -> shop_owner, no refresh needed';
+}, { needsDb: true });
+
+// The probe user is disposable and would otherwise accumulate on every run.
+// Deleting it cascades the profile row. An open pg client keeps the event loop
+// alive, so close it here rather than at exit.
+if (SB_URL && SB_KEY && !PUBLIC_ONLY) {
+  await gotrue(`/auth/v1/admin/users/${probe.id}`, { method: 'DELETE' }).catch(() => {});
+}
+await pgEnd();
+
+console.log('\nPOS & offline sync');
+const saleId = randomUUID();
+const batch = {
+  sales: [
+    {
+      client_sale_id: saleId,
+      sold_at: new Date().toISOString(),
+      payment_method: 'cash',
+      subtotal_cents: 3450, discount_cents: 0, total_cents: 3450,
+      amount_tendered_cents: 5000, change_cents: 1550,
+      items: [
+        { product_id: IDS.maize, qty: 1, unit_price_cents: 2000 },
+        { product_id: IDS.soap, qty: 2, unit_price_cents: 725 },
+      ],
+    },
+    {
+      // Deliberately wrong: total != subtotal - discount. Must fail ALONE.
+      client_sale_id: randomUUID(),
+      sold_at: new Date().toISOString(),
+      subtotal_cents: 3450, discount_cents: 0, total_cents: 3400,
+      items: [{ product_id: IDS.maize, qty: 1, unit_price_cents: 3450 }],
+    },
+  ],
+};
+
+await checkAuth('batch flush: partial success returns 207', async () => {
+  const r = await api(`/shops/${IDS.shop1}/sales/batch`, { method: 'POST', token: TOKENS.owner1, body: batch });
+  expect(r.status === 207, `status ${r.status}`);
+  expect(r.body.summary.created === 1, `expected 1 created, got ${r.body.summary.created}`);
+  expect(r.body.summary.failed === 1, `expected 1 failed, got ${r.body.summary.failed}`);
+  const bad = r.body.results.find((x) => x.status === 'failed');
+  expect(bad.error.code === 'TOTALS_MISMATCH', `expected TOTALS_MISMATCH, got ${bad.error?.code}`);
+  return 'one bad sale did not block the good one';
+});
+
+await checkAuth('replaying the same batch does NOT double-count', async () => {
+  const r = await api(`/shops/${IDS.shop1}/sales/batch`, { method: 'POST', token: TOKENS.owner1, body: batch });
+  expect(r.body.summary.created === 0, `replay created ${r.body.summary.created} extra sales — idempotency is broken`);
+  expect(r.body.summary.duplicate === 1, `expected 1 duplicate, got ${r.body.summary.duplicate}`);
+  return 'duplicate reported as success — clear it from the device queue';
+});
+
+await checkAuth('daily cash-up is populated', async () => {
+  const r = await api(`/shops/${IDS.shop1}/reports/daily`, { token: TOKENS.owner1 });
+  expect(r.body.sale_count > 0, 'no sales today — check the Africa/Johannesburg day bucketing');
+  return `${r.body.sale_count} sales, ${rands(r.body.net_cents)} net`;
+});
+
+await checkAuth('low-stock alert fires', async () => {
+  const r = await api(`/shops/${IDS.shop1}/inventory/low-stock`, { token: TOKENS.owner1 });
+  expect(r.body.meta.total >= 1, 'nothing flagged low — seed sets Clover Fresh Milk to 3/6');
+  return r.body.data.map((i) => `${i.product.name} ${i.stock_qty}/${i.low_stock_threshold}`).join(', ');
+});
+
+await checkAuth('offline delta pull returns a cursor', async () => {
+  const r = await api(`/shops/${IDS.shop1}/sync`, { token: TOKENS.owner1 });
+  expect(r.body.is_full_snapshot === true, 'first pull should be a full snapshot');
+  expect(r.body.server_time, 'server_time missing — the client needs it as the next cursor');
+  expect(r.body.inventory.length > 0, 'no inventory in the snapshot');
+  return `${r.body.inventory.length} lines, cursor ${r.body.server_time}`;
+});
+
+console.log('\nOrders');
+let quoteId, orderId;
+await checkAuth('quote prices a two-shop basket', async () => {
+  const r = await api('/orders/quote', {
+    method: 'POST', token: TOKENS.customer,
+    body: {
+      fulfilment_type: 'delivery', dropoff_lat: -26.2461, dropoff_lng: 27.9212,
+      items: [
+        { shop_id: IDS.shop1, product_id: IDS.maize, qty: 1 },
+        { shop_id: IDS.shop2, product_id: IDS.chakalaka, qty: 2 },
+      ],
+    },
+  });
+  expect(r.status === 200, `status ${r.status} ${JSON.stringify(r.body).slice(0, 120)}`);
+  expect(r.body.fee_breakdown.length >= 1, 'fee_breakdown is empty — the customer must see why');
+  quoteId = r.body.quote_id;
+  return `${rands(r.body.subtotal_cents)} + ${rands(r.body.service_fee_cents)} fee = ${rands(r.body.total_cents)}`;
+});
+
+await checkAuth('order placed from the quote', async () => {
+  const r = await api('/orders', {
+    method: 'POST', token: TOKENS.customer,
+    body: { quote_id: quoteId, dropoff_address: '77 Mooki St, Orlando East', dropoff_notes: 'Blue gate' },
+  });
+  expect(r.status === 201, `status ${r.status} ${JSON.stringify(r.body).slice(0, 120)}`);
+  orderId = r.body.id;
+  return `${r.body.order_number}, ${r.body.status}, ${rands(r.body.total_cents)}`;
+});
+
+await checkAuth('reusing a spent quote returns 409', async () => {
+  const r = await api('/orders', { method: 'POST', token: TOKENS.customer, body: { quote_id: quoteId } });
+  expect(r.status === 409, `status ${r.status}`);
+  expect(r.body.error.code === 'QUOTE_EXPIRED', `code ${r.body.error?.code}`);
+  return 'quotes are single-use';
+});
+
+await checkAuth('one shop accepts, the other rejects', async () => {
+  const a = await api(`/orders/${orderId}/legs/${IDS.shop1}/accept`, { method: 'POST', token: TOKENS.owner1, body: {} });
+  expect(a.status === 200, `accept status ${a.status}`);
+  const b = await api(`/orders/${orderId}/legs/${IDS.shop2}/reject`, { method: 'POST', token: TOKENS.owner2, body: { reason: 'out_of_stock' } });
+  expect(b.status === 200, `reject status ${b.status}`);
+
+  const o = await api(`/orders/${orderId}`, { token: TOKENS.customer });
+  expect(o.body.status === 'partially_accepted', `order status is ${o.body.status}`);
+  const rejected = o.body.legs.find((l) => l.status === 'rejected');
+  expect(rejected.rejected_reason === 'out_of_stock', 'rejection reason lost');
+  return `${o.body.status}, total now ${rands(o.body.total_cents)}`;
+});
+
+await checkAuth('a shop cannot touch another shop\'s leg', async () => {
+  const r = await api(`/orders/${orderId}/legs/${IDS.shop1}/accept`, { method: 'POST', token: TOKENS.owner2, body: {} });
+  expect(r.status === 403, `status ${r.status} — this MUST be 403`);
+  return 'cross-shop write blocked';
+});
+
+await checkAuth('ordering from an unlicensed shop returns 422', async () => {
+  const r = await api('/orders/quote', {
+    method: 'POST', token: TOKENS.customer,
+    body: { fulfilment_type: 'collection', items: [{ shop_id: IDS.shop3, product_id: IDS.maize, qty: 1 }] },
+  });
+  expect(r.status === 422, `status ${r.status}`);
+  expect(r.body.error.code === 'SHOP_NOT_ACCEPTING_ORDERS', `code ${r.body.error?.code}`);
+  return 'trading-licence gate holding';
+});
+
+await checkAuth('shop sees the order in its queue', async () => {
+  const r = await api(`/shops/${IDS.shop1}/orders`, { token: TOKENS.owner1 });
+  expect(r.body.data.length > 0, 'queue is empty');
+  const leg = r.body.data[0];
+  expect(!('customer_last_name' in leg), 'shop should only get a first name');
+  return `${r.body.data.length} legs, customer shown as "${leg.customer_first_name}"`;
+});
+
+
+console.log('\nDelivery & dispatch');
+let deliveryId, payoutCents;
+
+/**
+ * Every key in a response, at any depth.
+ *
+ * The customer delivery view is a whitelist built field by field, and this is
+ * what proves it stayed one. A single accidental spread of a database row would
+ * ship pickup addresses, the customer's phone number, or a courier position to
+ * every device — so this asserts on absence, not on the happy path.
+ */
+function allKeys(value, found = new Set()) {
+  if (Array.isArray(value)) { value.forEach((v) => allKeys(v, found)); return found; }
+  if (value && typeof value === 'object') {
+    for (const [k, v] of Object.entries(value)) { found.add(k); allKeys(v, found); }
+  }
+  return found;
+}
+
+await checkAuth('customer requests a courier', async () => {
+  const r = await api(`/orders/${orderId}/delivery`, { method: 'POST', token: TOKENS.customer, body: {} });
+  expect(r.status === 202, `status ${r.status} ${JSON.stringify(r.body).slice(0, 140)}`);
+  expect(r.body.status === 'unassigned', `status is ${r.body.status}`);
+  expect(r.body.courier === null, 'courier revealed before anyone was assigned');
+  expect(r.body.eta_band === null, 'an unassigned delivery cannot have an ETA');
+  deliveryId = r.body.id;
+  return `${r.body.id.slice(0, 8)}, unassigned`;
+});
+
+await checkAuth('requesting twice returns the same delivery, not a 409', async () => {
+  const r = await api(`/orders/${orderId}/delivery`, { method: 'POST', token: TOKENS.customer, body: {} });
+  expect(r.status === 202, `status ${r.status}`);
+  expect(r.body.id === deliveryId, 'a second request created a second delivery');
+  return 'idempotent on order_id';
+});
+
+await checkAuth('the job reaches the courier board', async () => {
+  const r = await api('/courier/jobs', { token: TOKENS.courier });
+  expect(r.status === 200, `status ${r.status} ${JSON.stringify(r.body).slice(0, 140)}`);
+  const job = r.body.data.find((j) => j.delivery_id === deliveryId);
+  expect(job, 'the delivery we just requested is not on the board');
+  expect(job.pickup_count === 1, `pickup_count ${job.pickup_count} — the rejected leg is not a pickup`);
+  expect(job.total_distance_m > 0, 'total_distance_m is 0 — the route was never measured');
+
+  const o = await api(`/orders/${orderId}`, { token: TOKENS.customer });
+  // Courier share, FEE_COURIER_SHARE_PCT in src/config/configuration.ts. Went
+  // 80 -> 75 with the fee model in issue #34; read it from the env rather than
+  // hardcoding, so the next change to it does not fail this check spuriously.
+  const sharePct = Number(process.env.FEE_COURIER_SHARE_PCT ?? 75);
+  const expected = Math.round((o.body.service_fee_cents * sharePct) / 100);
+  expect(job.payout_cents === expected, `payout ${job.payout_cents}, expected ${expected} (${sharePct}% of the service fee)`);
+  payoutCents = job.payout_cents;
+  return `${job.order_number}, ${job.total_distance_m}m, pays ${rands(job.payout_cents)}`;
+});
+
+await checkAuth('a customer cannot read the courier board', async () => {
+  const r = await api('/courier/jobs', { token: TOKENS.customer });
+  expect(r.status === 403, `status ${r.status} — pickup addresses MUST NOT reach a customer`);
+  return 'role gate holding';
+});
+
+await checkAuth('courier accepts the job', async () => {
+  const r = await api(`/courier/jobs/${deliveryId}/accept`, { method: 'POST', token: TOKENS.courier });
+  expect(r.status === 200, `status ${r.status} ${JSON.stringify(r.body).slice(0, 140)}`);
+  expect(r.body.status === 'assigned', `status is ${r.body.status}`);
+  expect(r.body.pickups[0].address_line, 'the courier view must carry pickup addresses');
+  expect(r.body.cash_to_collect_cents > 0, 'nothing to collect — v1 is cash on handover');
+  return `assigned, ${r.body.pickups.length} pickup, collect ${rands(r.body.cash_to_collect_cents)}`;
+});
+
+await checkAuth('a second accept returns 409, not a silent steal', async () => {
+  const r = await api(`/courier/jobs/${deliveryId}/accept`, { method: 'POST', token: TOKENS.courier });
+  expect(r.status === 409, `status ${r.status} — two couriers racing for one job must not both win`);
+  expect(r.body.error.code === 'DELIVERY_ALREADY_ASSIGNED', `code ${r.body.error?.code}`);
+  return 'conditional update held the line';
+});
+
+await checkAuth('the customer view carries no location, route or phone', async () => {
+  const r = await api(`/deliveries/${deliveryId}`, { token: TOKENS.customer });
+  expect(r.status === 200, `status ${r.status}`);
+  expect(r.body.courier === null, 'the courier is named before the goods are even collected');
+
+  const banned = [
+    'lat', 'lng', 'latitude', 'longitude', 'phone', 'customer_phone', 'address_line',
+    'dropoff', 'dropoff_address', 'dropoff_notes', 'pickups', 'positions',
+    'courier_id', 'payout_cents', 'cash_to_collect_cents', 'proof_photo_url',
+  ];
+  const keys = allKeys(r.body);
+  const leaked = banned.filter((k) => keys.has(k));
+  expect(leaked.length === 0, `LEAKED: ${leaked.join(', ')} — see docs/API_CONTRACT.md § Route privacy`);
+  return `${[...keys].length} keys, none of them a location`;
+});
+
+await checkAuth('collecting from a shop that is not on the run is refused', async () => {
+  const r = await api(`/courier/jobs/${deliveryId}/collect`, {
+    method: 'POST', token: TOKENS.courier, body: { shop_id: IDS.shop3 },
+  });
+  expect(r.status === 422, `status ${r.status}`);
+  return 'wrong shop rejected';
+});
+
+await checkAuth('an empty collect body works — the courier app sends one', async () => {
+  const r = await api(`/courier/jobs/${deliveryId}/collect`, { method: 'POST', token: TOKENS.courier, body: {} });
+  expect(r.status === 200, `status ${r.status} ${JSON.stringify(r.body).slice(0, 140)} — shop_id must stay optional`);
+  expect(r.body.status === 'collected', `status is ${r.body.status}`);
+  expect(r.body.pickups.every((pk) => pk.collected), 'a pickup is still open');
+
+  const o = await api(`/orders/${orderId}`, { token: TOKENS.customer });
+  expect(o.body.status === 'dispatched', `order status is ${o.body.status}, expected dispatched`);
+  return 'last pickup collected -> order dispatched';
+});
+
+await checkAuth('the courier is named only once the goods are collected', async () => {
+  const r = await api(`/deliveries/${deliveryId}`, { token: TOKENS.customer });
+  expect(r.body.courier !== null, 'courier still hidden after collection');
+  expect(/^\S+ \S\.$/.test(r.body.courier.display_name), `display_name "${r.body.courier.display_name}" is not "First L."`);
+  expect(r.body.eta_band !== null, 'no ETA band once a courier is on the way');
+  expect(!('phone' in r.body.courier), 'courier phone number leaked to the customer');
+  return `${r.body.courier.display_name}, ${r.body.eta_band}`;
+});
+
+await checkAuth('short cash at handover is refused', async () => {
+  const r = await api(`/courier/jobs/${deliveryId}/deliver`, {
+    method: 'POST', token: TOKENS.courier, body: { cash_collected_cents: 1 },
+  });
+  expect(r.status === 422, `status ${r.status}`);
+  expect(r.body.error.code === 'TOTALS_MISMATCH', `code ${r.body.error?.code}`);
+  return 'a short handover is a conversation at the gate, not a silent write';
+});
+
+await checkAuth('handover completes the order', async () => {
+  const o = await api(`/orders/${orderId}`, { token: TOKENS.customer });
+  const r = await api(`/courier/jobs/${deliveryId}/deliver`, {
+    method: 'POST', token: TOKENS.courier, body: { cash_collected_cents: o.body.total_cents },
+  });
+  expect(r.status === 200, `status ${r.status} ${JSON.stringify(r.body).slice(0, 140)}`);
+  expect(r.body.status === 'delivered', `status is ${r.body.status}`);
+
+  const after = await api(`/orders/${orderId}`, { token: TOKENS.customer });
+  expect(after.body.status === 'completed', `order status is ${after.body.status}`);
+  expect(after.body.delivery?.status === 'delivered', 'the order no longer reports its own delivery');
+  return `delivered, order completed, courier earned ${rands(payoutCents)}`;
+});
+
+// --- courier onboarding ----------------------------------------------------
+// Issue #25. The couriers table carried mode, radius, verification and
+// is_online from day one and nothing could write a row, so the only courier
+// that has ever existed is the one db/seed.sql inserts by hand — and is_online
+// was a flag the matching query read and nobody could set.
+//
+// Runs against a throwaway GoTrue user rather than Lerato: applying promotes a
+// customer to `courier` and writes a couriers row, and doing that to demo data
+// would quietly break the role-claim check above on the NEXT run (it asserts
+// Lerato clears the role gate and stops at the missing courier record). Deleting
+// the user at the end cascades the profile and the couriers row with it.
+
+console.log('\nCourier onboarding');
+
+const applicant = {
+  id: randomUUID(),
+  email: `smoke-courier-${Date.now()}@smartkasi.test`,
+  password: 'Password123!',
+};
+const ID_DOC = 'https://cdn.smartkasi.co.za/courier_id_doc/global/smoke-1.jpg';
+let applicantToken;
+
+await checkRole('a customer can apply to be a courier', async () => {
+  const created = await gotrue('/auth/v1/admin/users', {
+    method: 'POST',
+    body: {
+      id: applicant.id,
+      email: applicant.email,
+      password: applicant.password,
+      email_confirm: true,
+      user_metadata: { full_name: 'Smoke Applicant' },
+      app_metadata: { role: 'customer' },
+    },
+  });
+  expect(created.status === 200 || created.status === 201, `admin create returned ${created.status} ${created.raw.slice(0, 160)}`);
+  applicantToken = await signIn(applicant.email, applicant.password);
+
+  const before = await api('/courier/me', { token: applicantToken });
+  expect(before.status === 404, `a user who has never applied got ${before.status}, not 404`);
+
+  // The radius cap is refused, not silently clamped: the job board applies
+  // Math.min anyway, so storing 8000 would tell a foot courier they cover 8 km
+  // while matching them on 2.
+  const tooFar = await api('/courier/application', {
+    method: 'POST', token: applicantToken,
+    body: { mode: 'foot', max_radius_m: 8000, id_doc_url: ID_DOC },
+  });
+  expect(tooFar.status === 422, `8 km on foot returned ${tooFar.status}, expected 422`);
+
+  const noReg = await api('/courier/application', {
+    method: 'POST', token: applicantToken,
+    body: { mode: 'vehicle', id_doc_url: ID_DOC },
+  });
+  expect(noReg.status === 422, `a vehicle courier with no registration returned ${noReg.status}, expected 422`);
+
+  const r = await api('/courier/application', {
+    method: 'POST', token: applicantToken,
+    body: { mode: 'bicycle', max_radius_m: 2000, id_doc_url: ID_DOC },
+  });
+  expect(r.status === 202, `status ${r.status} ${JSON.stringify(r.body).slice(0, 160)}`);
+  expect(r.body.verification_status === 'pending', `a fresh application is ${r.body.verification_status} — applying must never grant verification`);
+  expect(r.body.is_online === false, 'a fresh application came back online');
+  expect(r.body.can_receive_jobs === false, 'an unverified courier can_receive_jobs');
+  return 'pending, offline, matched by nothing';
+});
+
+await checkRole('applying promotes the customer to courier', async () => {
+  if (!applicantToken) return 'skipped — the application above did not run';
+  const fresh = await signIn(applicant.email, applicant.password);
+  expect(claimRole(fresh) === 'courier', `the next token says ${claimRole(fresh)} — POST /courier/application did not write profiles.role`);
+  applicantToken = fresh;
+  return 'customer -> courier on the next token';
+});
+
+await checkRole('an unverified courier can go online and still not be matched', async () => {
+  if (!applicantToken) return 'skipped — the application above did not run';
+
+  // Allowed while pending on purpose. is_online is the courier's own statement
+  // of availability; is_verified is the platform's gate.
+  const on = await api('/courier/online', { method: 'POST', token: applicantToken });
+  expect(on.status === 200, `going online returned ${on.status} ${JSON.stringify(on.body).slice(0, 140)}`);
+  expect(on.body.is_online === true, 'is_online did not stick — this is the flag the matching query reads');
+  expect(on.body.can_receive_jobs === false, 'an unverified courier is being offered work');
+
+  const jobs = await api('/courier/jobs', { token: applicantToken });
+  expect(jobs.status === 422, `the job board returned ${jobs.status} to an unverified courier, expected 422`);
+  expect(jobs.body?.error?.code === 'COURIER_NOT_AVAILABLE', `code is ${jobs.body?.error?.code}`);
+  return 'online, still off the board until a human verifies';
+});
+
+await checkRole('an applicant cannot verify themselves, an operator can see them waiting', async () => {
+  if (!applicantToken) return 'skipped — the application above did not run';
+
+  // The whole reason verification is a separate role-gated endpoint and not a
+  // field on PATCH /courier/me.
+  const self = await api(`/admin/couriers/${applicant.id}/verify`, {
+    method: 'PATCH', token: applicantToken, body: { is_verified: true },
+  });
+  expect(self.status === 403, `a courier verifying themselves got ${self.status}, expected 403`);
+
+  // A verify endpoint keyed on a uuid is unusable if nothing hands out the
+  // uuids, and there is no other listing of couriers in the API.
+  const queue = await api('/admin/couriers?status=pending', { token: TOKENS.admin });
+  expect(queue.status === 200, `the review queue returned ${queue.status}`);
+  const row = queue.body.data.find((x) => x.id === applicant.id);
+  expect(row, 'the applicant is not in the pending queue — nothing surfaces them to an operator');
+  expect(row.id_doc_url === ID_DOC, `the queue row carries no document to review (${row.id_doc_url})`);
+  return '403 for the applicant, listed for the operator';
+});
+
+await checkRole('verified + offline is off the board, verified + online is on it', async () => {
+  if (!applicantToken) return 'skipped — the application above did not run';
+
+  // Was a raw UPDATE until PATCH /admin/couriers/{id}/verify existed (#26).
+  // Nothing in the API could write this column, so every applicant sat at
+  // pending for ever and the seeded courier was the only one who could work.
+  const approved = await api(`/admin/couriers/${applicant.id}/verify`, {
+    method: 'PATCH', token: TOKENS.admin, body: { is_verified: true },
+  });
+  expect(approved.status === 200, `verifying returned ${approved.status} ${JSON.stringify(approved.body).slice(0, 160)}`);
+  expect(approved.body.is_verified === true, 'the verification did not stick');
+  expect(approved.body.can_receive_jobs === true, 'verified and online, and still can_receive_jobs is false');
+
+  const online = await api('/courier/jobs', { token: applicantToken });
+  expect(online.status === 200, `a verified, online courier got ${online.status} on the board`);
+
+  const off = await api('/courier/offline', { method: 'POST', token: applicantToken });
+  expect(off.status === 200, `going offline returned ${off.status}`);
+  expect(off.body.can_receive_jobs === false, 'an offline courier can_receive_jobs');
+
+  const blocked = await api('/courier/jobs', { token: applicantToken });
+  expect(blocked.status === 422, `an offline courier got ${blocked.status} on the board, expected 422`);
+  return '200 online, 422 offline';
+});
+
+await checkRole('changing a reviewed field costs the verification, changing the radius does not', async () => {
+  if (!applicantToken) return 'skipped — the application above did not run';
+
+  const radius = await api('/courier/me', {
+    method: 'PATCH', token: applicantToken, body: { max_radius_m: 1500 },
+  });
+  expect(radius.status === 200, `status ${radius.status}`);
+  expect(radius.body.is_verified === true, 'nudging the radius de-verified the courier — nobody reviews that field');
+  expect(radius.body.max_radius_m === 1500, `max_radius_m is ${radius.body.max_radius_m}`);
+
+  // The one that matters: verified on a bicycle, then switch to a vehicle. If
+  // this kept is_verified it would be a self-service promotion past whatever
+  // check a vehicle is meant to get.
+  const upgrade = await api('/courier/me', {
+    method: 'PATCH', token: applicantToken, body: { mode: 'vehicle', vehicle_reg: 'CA 123-456' },
+  });
+  expect(upgrade.status === 200, `status ${upgrade.status} ${JSON.stringify(upgrade.body).slice(0, 160)}`);
+  expect(upgrade.body.is_verified === false, 'bicycle -> vehicle kept the verification a human gave to a bicycle');
+  expect(upgrade.body.verification_reset === true, 'verification_reset is false — the client has no way to warn the courier');
+  expect(upgrade.body.vehicle_reg === 'CA 123-456', `vehicle_reg is ${upgrade.body.vehicle_reg}`);
+
+  const back = await api('/courier/me', {
+    method: 'PATCH', token: applicantToken, body: { mode: 'foot' },
+  });
+  expect(back.body.vehicle_reg === null, 'switching off vehicle left a stale registration behind');
+  return 'radius free, mode/reg/ID back to pending';
+});
+
+await checkRole('revoking takes a courier off the board without switching them offline', async () => {
+  if (!applicantToken) return 'skipped — the application above did not run';
+
+  // The mode switch above reset the verification, so re-approve to have
+  // something to revoke. `false` is the only revocation path there is:
+  // couriers.is_verified is a boolean, so rejected and pending are one value.
+  await api(`/admin/couriers/${applicant.id}/verify`, {
+    method: 'PATCH', token: TOKENS.admin, body: { is_verified: true },
+  });
+  await api('/courier/online', { method: 'POST', token: applicantToken });
+
+  const revoked = await api(`/admin/couriers/${applicant.id}/verify`, {
+    method: 'PATCH', token: TOKENS.admin, body: { is_verified: false },
+  });
+  expect(revoked.status === 200, `revoking returned ${revoked.status}`);
+  expect(revoked.body.is_verified === false, 'is_verified survived a revocation');
+  // Deliberate: is_online is the courier's own statement of availability, so a
+  // courier re-approved next week does not also have to work out that they
+  // were silently switched off in the meantime.
+  expect(revoked.body.is_online === true, 'revoking silently switched the courier offline');
+  expect(revoked.body.can_receive_jobs === false, 'a revoked courier can_receive_jobs');
+
+  const jobs = await api('/courier/jobs', { token: applicantToken });
+  expect(jobs.status === 422, `a revoked courier got ${jobs.status} on the board, expected 422`);
+  return 'off the board, still holding their own online switch';
+});
+
+// --- trading licence, the admin half ---------------------------------------
+// Issue #26. POST /shops/{id}/licence has accepted submissions since v1 and
+// nothing could act on one, so `accepts_orders` was unreachable for every shop
+// that db/seed.sql did not insert already verified.
+//
+// Runs against Naledi's shop — the unlicensed fixture the checks near the top
+// of this file depend on — and puts it back with one UPDATE at the end. There
+// is deliberately no route back to `none`: "never submitted" is not a decision
+// a reviewer gets to make, so restoring the fixture is a database job.
+
+console.log('\nTrading licence — the admin half');
+
+await checkLicence('a licence nobody submitted cannot be verified', async () => {
+  const r = await api(`/admin/shops/${IDS.shop3}/licence`, {
+    method: 'PATCH', token: TOKENS.admin, body: { licence_status: 'verified' },
+  });
+  expect(r.status === 422, `verifying a shop that never submitted returned ${r.status}, expected 422`);
+  expect(r.body.error?.code === 'VALIDATION_FAILED', `code is ${r.body.error?.code}`);
+
+  const owner = await api(`/admin/shops/${IDS.shop3}/licence`, {
+    method: 'PATCH', token: TOKENS.owner3, body: { licence_status: 'verified' },
+  });
+  expect(owner.status === 403, `a shop owner verifying a licence got ${owner.status}, expected 403`);
+  return '422 for the operator, 403 for anyone else';
+});
+
+await checkLicence('submit, verify, and the shop can finally take orders', async () => {
+  const submitted = await api(`/shops/${IDS.shop3}/licence`, {
+    method: 'POST', token: TOKENS.owner3,
+    body: {
+      trading_licence_no: 'GP/SOW/2026/SMOKE',
+      licence_doc_url: 'https://cdn.smartkasi.co.za/licence_doc/global/smoke-1.pdf',
+      licence_expires_at: '2030-01-31',
+    },
+  });
+  expect(submitted.status === 202, `submitting returned ${submitted.status} ${JSON.stringify(submitted.body).slice(0, 160)}`);
+  expect(submitted.body.licence_status === 'pending', `licence_status is ${submitted.body.licence_status}`);
+
+  const queue = await api('/admin/shops?licence_status=pending', { token: TOKENS.admin });
+  expect(queue.status === 200, `the licence queue returned ${queue.status}`);
+  expect(queue.body.data.some((x) => x.id === IDS.shop3), 'the submission is not in the pending queue');
+
+  // Backdated: verifying a licence that has already run out would put the shop
+  // straight into the state `expired` exists to describe, and open orders on it.
+  const stale = await api(`/admin/shops/${IDS.shop3}/licence`, {
+    method: 'PATCH', token: TOKENS.admin,
+    body: { licence_status: 'verified', licence_expires_at: '2020-01-31' },
+  });
+  expect(stale.status === 422, `verifying an expired licence returned ${stale.status}, expected 422`);
+
+  const verified = await api(`/admin/shops/${IDS.shop3}/licence`, {
+    method: 'PATCH', token: TOKENS.admin, body: { licence_status: 'verified' },
+  });
+  expect(verified.status === 200, `verifying returned ${verified.status} ${JSON.stringify(verified.body).slice(0, 160)}`);
+  expect(verified.body.licence_status === 'verified', `licence_status is ${verified.body.licence_status}`);
+
+  // The point of the whole feature: this 422'd for the life of v1.
+  const open = await api(`/shops/${IDS.shop3}`, {
+    method: 'PATCH', token: TOKENS.owner3, body: { accepts_orders: true, mode: 'full' },
+  });
+  expect(open.status === 200, `switching orders on returned ${open.status} ${JSON.stringify(open.body).slice(0, 160)}`);
+  expect(open.body.accepts_orders === true, 'accepts_orders did not stick on a verified shop');
+  return 'pending -> verified -> accepting orders';
+});
+
+await checkLicence('revoking a licence closes the shop it had already opened', async () => {
+  // PATCH /shops/{id} guards the transition ON. It never guarded a shop that
+  // was already open, so before this endpoint a revoked licence left orders
+  // flowing — the one moment the gate is actually for.
+  const revoked = await api(`/admin/shops/${IDS.shop3}/licence`, {
+    method: 'PATCH', token: TOKENS.admin, body: { licence_status: 'rejected' },
+  });
+  expect(revoked.status === 200, `rejecting returned ${revoked.status}`);
+  expect(revoked.body.licence_status === 'rejected', `licence_status is ${revoked.body.licence_status}`);
+  expect(revoked.body.accepts_orders === false, 'a shop with a rejected licence is still accepting orders');
+
+  const quote = await api('/orders/quote', {
+    method: 'POST', token: TOKENS.customer,
+    body: { fulfilment_type: 'collection', items: [{ shop_id: IDS.shop3, product_id: IDS.maize, qty: 1 }] },
+  });
+  expect(quote.status === 422, `ordering from a rejected shop returned ${quote.status}, expected 422`);
+  return 'rejected, closed, and refusing baskets again';
+});
+
+// Put Naledi's shop back the way db/seed.sql left it, so the checks at the top
+// of this file still describe an unlicensed shop on the next run.
+if (PG_URL && !PUBLIC_ONLY) {
+  await pgOne(
+    `update public.shops
+        set licence_status = 'none',
+            trading_licence_no = null,
+            licence_doc_url = null,
+            licence_expires_at = null,
+            accepts_orders = false,
+            mode = 'advertising_only'
+      where id = $1`,
+    [IDS.shop3],
+  );
+}
+
+// Disposable, like the role-claim probe. Deleting the auth user cascades the
+// profile, which cascades the couriers row.
+if (SB_URL && SB_KEY && !PUBLIC_ONLY) {
+  await gotrue(`/auth/v1/admin/users/${applicant.id}`, { method: 'DELETE' }).catch(() => {});
+}
+await pgEnd();
+
+console.log('\nStubs (shape only — values are fake)');
+await checkAuth('AI dish endpoint is marked as a stub', async () => {
+  const r = await api('/ai/dish-ingredients', { method: 'POST', token: TOKENS.customer, body: { dish: 'pap and chakalaka' } });
+  expect(r.body._stub === true, 'stub marker missing');
+  return 'returns a fixed basket — do not build logic on it';
+});
+
+await checkAuth('payments returns not_implemented, not a fake success', async () => {
+  const r = await api('/payments/intent', { method: 'POST', token: TOKENS.customer, body: { order_id: orderId } });
+  expect(r.body.status === 'not_implemented', `status ${r.body.status}`);
+  expect(r.body.checkout_url === null, 'checkout_url should be null');
+  return 'v1 is cash only';
+});
+
+// ---- summary --------------------------------------------------------------
+
+const total = passed + failures.length;
+console.log(`\n${'-'.repeat(58)}`);
+if (failures.length === 0) {
+  const note = skipped ? ` ${c.y}${skipped} skipped — run without --public-only for the full suite.${c.x}` : '';
+  console.log(`${c.g}All ${total} checks passed.${c.x}${note}\n`);
+  process.exit(0);
+}
+console.log(`${c.r}${failures.length} of ${total} checks failed:${c.x}`);
+for (const f of failures) console.log(`  ${c.r}·${c.x} ${f.name}\n    ${f.message}`);
+console.log('');
+process.exit(1);
+
+// ---- role-claim helpers ---------------------------------------------------
+
+/**
+ * Like checkAuth, but these need the service-role key (to provision a throwaway
+ * user) and sometimes a direct Postgres connection. Missing credentials is a
+ * skip, not a failure — the same run has to work in CI without secrets. It says
+ * which variable is missing, because a silent skip here is how the original bug
+ * survived.
+ */
+async function checkRole(name, fn, { needsDb = false } = {}) {
+  const missing = [];
+  if (!SB_URL) missing.push('SUPABASE_URL');
+  if (!SB_KEY) missing.push('SUPABASE_SERVICE_ROLE_KEY');
+  if (needsDb && !PG_URL) missing.push('DIRECT_URL');
+
+  if (PUBLIC_ONLY || missing.length) {
+    skipped++;
+    const why = PUBLIC_ONLY ? 'needs a token' : `needs ${missing.join(' + ')}`;
+    console.log(`  ${c.y}SKIP${c.x}  ${name}  ${c.d}(${why})${c.x}`);
+    return;
+  }
+  return check(name, fn);
+}
+
+/**
+ * For checks that exercise a route by mutating seeded demo data. They need
+ * DIRECT_URL not to run the route but to put the fixture back afterwards, so
+ * without it the whole group skips rather than leaving the next run a shop
+ * whose licence_status no longer matches what the checks above assert.
+ */
+async function checkLicence(name, fn) {
+  if (PUBLIC_ONLY || !PG_URL) {
+    skipped++;
+    const why = PUBLIC_ONLY ? 'needs a token' : 'needs DIRECT_URL to restore the fixture';
+    console.log(`  ${c.y}SKIP${c.x}  ${name}  ${c.d}(${why})${c.x}`);
+    return;
+  }
+  return check(name, fn);
+}
+
+async function gotrue(path, { method = 'GET', body } = {}) {
+  const res = await fetch(`${SB_URL}${path}`, {
+    method,
+    headers: {
+      apikey: SB_KEY,
+      Authorization: `Bearer ${SB_KEY}`,
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const raw = await res.text();
+  let json;
+  try { json = raw ? JSON.parse(raw) : null; } catch { json = null; }
+  return { status: res.status, body: json, raw };
+}
+
+// signIn() and claimRole() live further down — one copy, shared by both the
+// role-claim checks above and the admin-endpoint checks.
+
+/** One row, or undefined. Opens the connection on first use. */
+async function pgOne(sql, params) {
+  if (!pgClient) {
+    const { default: pg } = await import('pg');
+    pgClient = new pg.Client({
+      connectionString: PG_URL,
+      ssl: /supabase\.(co|com)/.test(PG_URL) ? { rejectUnauthorized: false } : undefined,
+    });
+    await pgClient.connect();
+  }
+  const res = await pgClient.query(sql, params);
+  return res.rows[0];
+}
+
+async function pgEnd() {
+  if (!pgClient) return;
+  const client = pgClient;
+  pgClient = undefined;
+  await client.end().catch(() => {});
+}
+
+// ---- helpers --------------------------------------------------------------
+
+function argValue(flag) {
+  const i = process.argv.indexOf(flag);
+  return i > -1 ? process.argv[i + 1] : undefined;
+}
+
+/**
+ * Minimal .env reader. Deliberately tolerant: CRLF line endings (Windows),
+ * quoted values, `export` prefixes, blank lines and comments. A stray \r in a
+ * JWT secret produces tokens the API rejects with no useful error, so the
+ * trimming here is load-bearing.
+ */
+function loadDotEnv(path) {
+  try {
+    const text = readFileSync(path, 'utf8');
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith('#')) continue;
+      const m = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+      if (!m) continue;
+      const key = m[1];
+      let value = m[2].trim().replace(/^(['"])(.*)\1$/s, '$2');
+      if (!process.env[key]) process.env[key] = value;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+
+// ---- role claim helpers ---------------------------------------------------
+
+
+/** The role the API will actually authorise on — read from the token, not /me. */
+function claimRole(token) {
+  if (!token) return undefined;
+  try {
+    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8'));
+    return payload?.app_metadata?.role;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Sign a demo user in for a FRESH token. The point is the round trip: a role
+ * change only shows up in a newly minted token, so re-reading an existing one
+ * would pass whether the hook works or not.
+ */
+async function signIn(email, password = 'Password123!') {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) throw new Error('SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY missing from apps/api/.env');
+
+  const res = await fetch(`${url}/auth/v1/token?grant_type=password`, {
+    method: 'POST',
+    headers: { apikey: key, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok || !body?.access_token) {
+    throw new Error(`sign-in for ${email} failed (${res.status}) — run \`npm run db:users\``);
+  }
+  return body.access_token;
+}
+function mint(sub, role) {
+  if (!SECRET) return undefined;
+  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+  const now = Math.floor(Date.now() / 1000);
+  const head = b64({ alg: 'HS256', typ: 'JWT' });
+  const payload = b64({ sub, app_metadata: { role }, iat: now, exp: now + 3600 });
+  const sig = createHmac('sha256', SECRET).update(`${head}.${payload}`).digest('base64url');
+  return `${head}.${payload}.${sig}`;
+}
